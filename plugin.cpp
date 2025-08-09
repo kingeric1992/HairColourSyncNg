@@ -1,9 +1,10 @@
 #include "plugin.h"
+#include <Psapi.h>
 
 static void appendHairShader(RE::NiProperty* prop, std::vector<RE::BSShaderProperty*>& shaders)
 {
 	if (!prop || prop->GetType() != RE::NiProperty::Type::kShade)
-		return; 
+		return;
 	if (auto shader = static_cast<RE::BSShaderProperty*>(prop);
 		shader->material && shader->material->GetFeature() == RE::BSShaderMaterial::Feature::kHairTint)
 		shaders.push_back(shader);
@@ -12,17 +13,18 @@ static void findHairShaders(RE::NiAVObject* av, std::vector<RE::BSShaderProperty
 {
 	assert(av);
 	if (auto shape = av->AsTriShape())
-		appendHairShader(shape->properties[RE::BSGeometry::States::kEffect].get(), shaders);
+		appendHairShader(shape->GetGeometryRuntimeData().properties[RE::BSGeometry::States::kEffect].get(), shaders);
 	else if (auto shape = av->AsNiTriShape())
-		appendHairShader(shape->spEffectState.get(), shaders);
+		appendHairShader(shape->GetRuntimeData().spEffectState.get(), shaders);
 	else if (RE::NiNode* node = av->AsNode()) {
-		for(auto& child : node->children)
+		for (auto& child : node->GetChildren())
 			if (child)
 				findHairShaders(child.get(), shaders);
 	}
-	static_assert(offsetof(RE::BSTriShape, properties[1]) == 0x128);
-	static_assert(offsetof(RE::NiTriShape, spEffectState) == 0x118);
-	static_assert(offsetof(RE::NiNode, children) == 0x110);
+	// vr compatible build does not support static offset
+	//static_assert(offsetof(RE::BSTriShape, properties[1]) == 0x128);
+	//static_assert(offsetof(RE::NiTriShape, spEffectState) == 0x118);
+	//static_assert(offsetof(RE::NiNode, children) == 0x110);
 }
 static RE::BGSColorForm* getHairColor(RE::TESNPC* base)
 {
@@ -49,31 +51,28 @@ static void attach(RE::NiNode* root, RE::TESNPC* npc)
 	//if its tint color does not match the colour of npc's hair,
 	//replace it with a new material.
 	auto* hairColor = getHairColor(npc);
-
 	if (!hairColor)
 		return;
 
-	RE::NiColor col{
-		hairColor->color.red / 128.0f,
-		hairColor->color.green / 128.0f,
-		hairColor->color.blue / 128.0f
-	};
+	RE::NiColor col{hairColor->color};
+	col *= 2;
 
 	std::vector<RE::BSShaderProperty*> shaders;
 	findHairShaders(root, shaders);
 
 	for (auto&& shader : shaders) {
+		auto* mat = shader->GetBaseMaterial();
 		//shaders should only contain HairTint materials at this point
-		assert(shader->material && shader->material->GetFeature() == RE::BSShaderMaterial::Feature::kHairTint);
+		assert(mat && mat->GetFeature() == RE::BSShaderMaterial::Feature::kHairTint);
 
 		//I don't see exactly why this works (dividing by 128 instead of 255),
 		//but it definitely does give us the right colour in game.
 		// kingeric: these shader are applied as mult mask.
 		if (RE::BSLightingShaderMaterialHairTint* oldMat, *newMat;
-			(oldMat = static_cast<RE::BSLightingShaderMaterialHairTint*>(shader->material), oldMat->tintColor != col) && 
-			(newMat = static_cast<RE::BSLightingShaderMaterialHairTint*>(shader->material->Create())))
-		{	
-			newMat->CopyMembers(shader->material);
+			(oldMat = static_cast<RE::BSLightingShaderMaterialHairTint*>(mat), oldMat->tintColor != col) &&
+			(newMat = static_cast<RE::BSLightingShaderMaterialHairTint*>(mat->Create())))
+		{
+			newMat->CopyMembers(mat);
 			newMat->tintColor = col;
 
 			//If newMaterial is not yet hashed (key == -1), BSShaderProperty::SetMaterial will 
@@ -94,7 +93,7 @@ static void attach(RE::NiNode* root, RE::TESNPC* npc)
 
 			//Thus, newMaterial will be unused at this point and must be cleaned up by us.
 			//(note: the virtual dtor calls the Skyrim memory manager as appropriate)
-			assert(shader->material != newMat);
+			assert(mat != newMat);
 			delete newMat;
 
 			//The duplicate material assigned to the shader is managed by the resource handler 
@@ -106,15 +105,41 @@ static void* AttachArmor_orig{};
 static RE::NiAVObject* AttachArmor_hook(RE::BipedAnim* _this, RE::NiNode* armor, RE::NiNode* skeleton,
 	void* a4, char a5, char a6, void* a7)
 {
-	if (armor && skeleton && skeleton->userData && skeleton->userData->data.objectReference
-		&& skeleton->userData->data.objectReference->Is(RE::FormType::NPC)) {
-		attach(armor, static_cast<RE::TESNPC*>(skeleton->userData->data.objectReference));
+	if (armor && skeleton) {
+		if (auto* userData = skeleton->GetUserData(); userData &&
+			userData->GetObjectReference() && userData->GetObjectReference()->Is(RE::FormType::NPC))
+			attach(armor, static_cast<RE::TESNPC*>(userData->GetObjectReference()));
 	}
 	return reinterpret_cast<decltype(&AttachArmor_hook)>(AttachArmor_orig)(_this, armor, skeleton, a4, a5, a6, a7);
 }
-void hook() 
+static uintptr_t getModuleOffset(uintptr_t pFunc, char* name, size_t size) {
+	__try { // probably safer?	
+		auto getModule = [](uintptr_t addr, char* cbuf, size_t ss) [[msvc::forceinline]] -> uintptr_t {
+			DWORD cbNeeded;
+			auto proc = GetCurrentProcess();
+			if (HMODULE hmods[1024]; EnumProcessModules(proc, hmods, sizeof(hmods), &cbNeeded))
+				for (int i = 0; i < (cbNeeded / sizeof(HMODULE)); ++i)
+					if (MODULEINFO modInfo; GetModuleInformation(proc, hmods[i], &modInfo, sizeof(modInfo)) &&
+						(uintptr_t)modInfo.lpBaseOfDll <= addr && addr < ((uintptr_t)modInfo.lpBaseOfDll + modInfo.SizeOfImage))
+					{
+						//char szModName[MAX_PATH];
+						GetModuleFileName(hmods[i], cbuf, ss);
+						return addr - (uintptr_t)modInfo.lpBaseOfDll;
+					}
+			return { };
+		};
+		auto unwrap = [](uintptr_t addr) [[msvc::forceinline]] -> uintptr_t {
+			return *(WORD*)(addr) == 0x25FF ? (addr + 6) /* rip */ + *(INT32*)(addr + 2) /* rel32 */ : NULL;
+		};
+		if (auto target = unwrap(pFunc); target || (target = unwrap(pFunc + 5 + *(INT32*)(pFunc + 1))))
+			return getModule(*(uintptr_t*)target, name, size);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	return {};
+}
+void hook()
 {
-	auto& trampoline = SKSE::GetTrampoline();
 	// (1.5.97) bipedAnim::attachArmor_1401CAFB0
 	//.text:00000001401CAFB0 44 89 4C 24 20 | mov     dword ptr[rsp - 8 + a4], r9d
 	//.text:00000001401CAFB5 4C 89 44 24 18 | mov     [rsp - 8 + a1], r8
@@ -122,20 +147,37 @@ void hook()
 	// (1.6.1170) bipedAnim::attachArmor_140217890
 	//.text:0000000140217890 44 89 4C 24 20 | mov     dword ptr [rsp-8+arg_18], r9d
 	//.text:0000000140217895 4C 89 44 24 18 | mov     [rsp-8+arg_10], r8
-	auto pFunc = REL::Relocation<decltype(&AttachArmor_hook)>{ RELOCATION_ID(15535, 15712) }.address();
+
+	// (1.4.15) bipedAnim::attachArmor_0x1401db9e0 (VR)
+	//.text:00000001401DB9E0 44 89 4C 24 20 | mov     [rsp+20h], r9d
+	//.text:00000001401DB9E5 4C 89 44 24 18 | mov     [rsp+18h], r8
+
+	auto pfn = REL::Relocation{ RELOCATION_ID(15535, 15712) }.address();
 
 #pragma pack(1)
 	struct { BYTE db[5]; UINT8 jmp; INT32 rel32; } aob{
-		{ 0x44, 0x89, 0x4C, 0x24, 0x20 }, 0xE9, 0}; //jmp to pFunc + 5 
+		{ 0x44, 0x89, 0x4C, 0x24, 0x20 }, 0xE9, 0 }; //jmp to pFunc + 5 
 
-	if(memcmp(&aob, (void*)pFunc, 5))
-		SKSE::stl::report_and_fail(std::format("AOB missmatch {}", prnAOB(aob.db)), SOURCE("plugin.cpp"));
+	if (memcmp(&aob, (void*)pfn, 5)) {
+		switch (*(BYTE*)pfn) {
+		case 0xFF: // abs long jump
+		case 0xE8: // rel32 call
+		case 0xE9: // rel32 jump
+			char name[MAX_PATH] = {};
+			if( uintptr_t offset = getModuleOffset(pfn, name, sizeof(name)))
+				SKSE::stl::report_and_fail(std::format("AOB missmatch at [SkyrimSE.exe+{:X}]\n{}.\n\nTargeting\n{}+{:X}",
+					pfn - (uintptr_t)GetModuleHandle(NULL), prnAOB(*(BYTE(*)[5])pfn), name, offset), SOURCE("plugin.cpp"));
+		}
+		SKSE::stl::report_and_fail(std::format("AOB missmatch at [SkyrimSE.exe+{:X}]\n{}.\n\nPossible unsupported binary or not compatible with other mod.",
+			pfn - (uintptr_t)GetModuleHandle(NULL), prnAOB(*(BYTE(*)[5])pfn)), SOURCE("plugin.cpp"));
+	}
+	auto& trampoline = SKSE::GetTrampoline();
 
-	if(AttachArmor_orig = trampoline.allocate(sizeof(aob)); !AttachArmor_orig)
+	if (AttachArmor_orig = trampoline.allocate(sizeof(aob)); !AttachArmor_orig)
 		SKSE::stl::report_and_fail("Failed to allocate memory for AttachArmor hook", SOURCE("plugin.cpp"));
 
-	aob.rel32 = (INT32)((uintptr_t)pFunc + sizeof(aob.db) - (uintptr_t)AttachArmor_orig - sizeof(aob));
+	aob.rel32 = (INT32)(pfn + sizeof(aob.db) - (uintptr_t)AttachArmor_orig - sizeof(aob));
 	memcpy_s(AttachArmor_orig, sizeof(aob), &aob, sizeof(aob));
 
-	trampoline.write_branch<5>(pFunc, (uintptr_t)AttachArmor_hook);
+	trampoline.write_branch<5>(pfn, (uintptr_t)AttachArmor_hook);
 }
