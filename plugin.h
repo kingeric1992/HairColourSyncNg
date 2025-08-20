@@ -18,3 +18,4 @@ inline std::string prnAOB(const BYTE(&a)[T]) {
 #define SOURCE(f) std::source_location::current(__builtin_LINE(), __builtin_COLUMN(), f)
 
 void hook();
+void attachPlayer(RE::BSTSmartPointer<RE::BSScript::Object>);

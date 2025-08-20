@@ -1,34 +1,37 @@
 #include "plugin.h"
 #include <Psapi.h>
 
-static void appendHairShader(RE::NiProperty* prop, std::vector<RE::BSShaderProperty*>& shaders)
-{
-	if (!prop || prop->GetType() != RE::NiProperty::Type::kShade)
-		return;
-	if (auto shader = static_cast<RE::BSShaderProperty*>(prop);
-		shader->material && shader->material->GetFeature() == RE::BSShaderMaterial::Feature::kHairTint)
-		shaders.push_back(shader);
-}
-static void findHairShaders(RE::NiAVObject* av, std::vector<RE::BSShaderProperty*>& shaders)
+// return true if found any.
+template<class T>
+static bool findHairShaders(RE::NiAVObject* av, T&& fn)
 {
 	assert(av);
+
+	bool res = false;
+
+	RE::NiProperty* prop{};
 	if (auto shape = av->AsTriShape())
-		appendHairShader(shape->GetGeometryRuntimeData().properties[RE::BSGeometry::States::kEffect].get(), shaders);
+		prop = shape->GetGeometryRuntimeData().properties[RE::BSGeometry::States::kEffect].get();
 	else if (auto shape = av->AsNiTriShape())
-		appendHairShader(shape->GetRuntimeData().spEffectState.get(), shaders);
+		prop = shape->GetRuntimeData().spEffectState.get();
 	else if (RE::NiNode* node = av->AsNode()) {
 		for (auto& child : node->GetChildren())
 			if (child)
-				findHairShaders(child.get(), shaders);
+				res |= findHairShaders(child.get(), fn);
 	}
-	// vr compatible build does not support static offset
-	//static_assert(offsetof(RE::BSTriShape, properties[1]) == 0x128);
-	//static_assert(offsetof(RE::NiTriShape, spEffectState) == 0x118);
-	//static_assert(offsetof(RE::NiNode, children) == 0x110);
+	if (!prop || prop->GetType() != RE::NiProperty::Type::kShade)
+		return res;
+	return res |= fn(static_cast<RE::BSShaderProperty*>(prop));
 }
+// vr compatible build does not support static offset
+//static_assert(offsetof(RE::BSTriShape, properties[1]) == 0x128);
+//static_assert(offsetof(RE::NiTriShape, spEffectState) == 0x118);
+//static_assert(offsetof(RE::NiNode, children) == 0x110);
+
 static RE::BGSColorForm* getHairColor(RE::TESNPC* base)
 {
-	assert(base);
+	if (!base)
+		return nullptr;
 
 	//Check in this record first
 	if (base->headRelatedData && base->headRelatedData->hairColor)
@@ -45,32 +48,22 @@ static RE::BGSColorForm* getHairColor(RE::TESNPC* base)
 			return face->defaultHairColor;
 	return nullptr;
 }
-static void attach(RE::NiNode* root, RE::TESNPC* npc)
+static bool attach(RE::NiAVObject* root, RE::BGSColorForm* hairCol)
 {
 	//This will look at every HairTint material under root and,
 	//if its tint color does not match the colour of npc's hair,
 	//replace it with a new material.
-	auto* hairColor = getHairColor(npc);
-	if (!hairColor)
-		return;
 
-	RE::NiColor col{hairColor->color};
-	col *= 2;
+	RE::NiColor col{hairCol->color};
+	col *= 2; // confirmed in game disambly.
 
-	std::vector<RE::BSShaderProperty*> shaders;
-	findHairShaders(root, shaders);
-
-	for (auto&& shader : shaders) {
-		auto* mat = shader->GetBaseMaterial();
-		//shaders should only contain HairTint materials at this point
-		assert(mat && mat->GetFeature() == RE::BSShaderMaterial::Feature::kHairTint);
-
-		//I don't see exactly why this works (dividing by 128 instead of 255),
-		//but it definitely does give us the right colour in game.
-		// kingeric: these shader are applied as mult mask.
-		if (RE::BSLightingShaderMaterialHairTint* oldMat, *newMat;
+	return findHairShaders(root, [&col](RE::BSShaderProperty* shader) {
+		RE::BSShaderMaterial* mat;
+		RE::BSLightingShaderMaterialHairTint* oldMat, * newMat;
+		if (shader && (mat = shader->GetBaseMaterial()) && 
+			mat->GetFeature() == RE::BSShaderMaterial::Feature::kHairTint &&
 			(oldMat = static_cast<RE::BSLightingShaderMaterialHairTint*>(mat), oldMat->tintColor != col) &&
-			(newMat = static_cast<RE::BSLightingShaderMaterialHairTint*>(mat->Create())))
+			(newMat = static_cast<RE::BSLightingShaderMaterialHairTint*>(mat->Create())) )
 		{
 			newMat->CopyMembers(mat);
 			newMat->tintColor = col;
@@ -98,17 +91,22 @@ static void attach(RE::NiNode* root, RE::TESNPC* npc)
 
 			//The duplicate material assigned to the shader is managed by the resource handler 
 			//and will be cleaned up by them when appropriate.
+			return true;
 		}
-	}
+		return false;
+	});
 }
 static void* AttachArmor_orig{};
 static RE::NiAVObject* AttachArmor_hook(RE::BipedAnim* _this, RE::NiNode* armor, RE::NiNode* skeleton,
 	void* a4, char a5, char a6, void* a7)
 {
-	if (armor && skeleton) {
-		if (auto* userData = skeleton->GetUserData(); userData &&
-			userData->GetObjectReference() && userData->GetObjectReference()->Is(RE::FormType::NPC))
-			attach(armor, static_cast<RE::TESNPC*>(userData->GetObjectReference()));
+	RE::TESNPC* npc;
+	RE::BGSColorForm* hair;
+	if (auto ref = armor && skeleton ? skeleton->GetUserData() : nullptr; ref && ref->GetObjectReference() &&
+		(hair = getHairColor(npc = ref->GetObjectReference()->As<RE::TESNPC>()))) // only proceed if have hair.
+	{
+		if (attach(armor, hair))
+			npc->SetHairColor(hair); // in case hair is not set at npc node.
 	}
 	return reinterpret_cast<decltype(&AttachArmor_hook)>(AttachArmor_orig)(_this, armor, skeleton, a4, a5, a6, a7);
 }
@@ -180,4 +178,14 @@ void hook()
 	memcpy_s(AttachArmor_orig, sizeof(aob), &aob, sizeof(aob));
 
 	trampoline.write_branch<5>(pfn, (uintptr_t)AttachArmor_hook);
+}
+void attachPlayer(RE::BSTSmartPointer<RE::BSScript::Object> script) {
+	if (RE::BSScript::Variable* custom{}, * col{}, * hair{}; 
+		(custom = script->GetVariable({ "_customHair"sv })) && custom->GetBool() &&
+		(col = script->GetVariable({ "_color"sv })) && 
+		(hair = script->GetVariable({"_hairColor"sv})))
+	{
+		// _hairColor form should always be avaliable when this is called.
+		attach(RE::PlayerCharacter::GetSingleton()->Get3D(), hair->Unpack<RE::BGSColorForm*>());
+	}
 }
