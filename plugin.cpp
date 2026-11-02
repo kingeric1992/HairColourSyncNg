@@ -11,7 +11,7 @@ static bool findHairShaders(RE::NiAVObject* av, T&& fn)
 
 	RE::NiProperty* prop{};
 	if (auto shape = av->AsTriShape())
-		prop = shape->GetGeometryRuntimeData().properties[RE::BSGeometry::States::kEffect].get();
+		prop = shape->GetGeometryRuntimeData().shaderProperty.get();
 	else if (auto shape = av->AsNiTriShape())
 		prop = shape->GetRuntimeData().spEffectState.get();
 	else if (RE::NiNode* node = av->AsNode()) {
@@ -112,7 +112,7 @@ static RE::NiAVObject* AttachArmor_hook(RE::BipedAnim* _this, RE::NiNode* armor,
 }
 static uintptr_t getModuleOffset(uintptr_t pFunc, char* name, size_t size) {
 	__try { // probably safer?	
-		auto getModule = [](uintptr_t addr, char* cbuf, size_t ss) [[msvc::forceinline]] -> uintptr_t {
+		auto getModule = [](uintptr_t addr, char* cbuf, size_t ss) -> uintptr_t {
 			DWORD cbNeeded;
 			auto proc = GetCurrentProcess();
 			if (HMODULE hmods[1024]; EnumProcessModules(proc, hmods, sizeof(hmods), &cbNeeded))
@@ -126,7 +126,7 @@ static uintptr_t getModuleOffset(uintptr_t pFunc, char* name, size_t size) {
 					}
 			return { };
 		};
-		auto unwrap = [](uintptr_t addr) [[msvc::forceinline]] -> uintptr_t {
+		auto unwrap = [](uintptr_t addr) -> uintptr_t {
 			return *(WORD*)(addr) == 0x25FF ? (addr + 6) /* rip */ + *(INT32*)(addr + 2) /* rel32 */ : NULL;
 		};
 		if (auto target = unwrap(pFunc); target || (target = unwrap(pFunc + 5 + *(INT32*)(pFunc + 1))))
@@ -185,7 +185,9 @@ void attachPlayer(RE::BSTSmartPointer<RE::BSScript::Object> script) {
 		(col = script->GetVariable({ "_color"sv })) && 
 		(hair = script->GetVariable({"_hairColor"sv})))
 	{
-		// _hairColor form should always be avaliable when this is called.
-		attach(RE::PlayerCharacter::GetSingleton()->Get3D(false), hair->Unpack<RE::BGSColorForm*>());
+		// _hairColor can be None (seen on save load via RSM_Initialized), and the player may have no 3D yet.
+		if (auto color = hair->Unpack<RE::BGSColorForm*>())
+			if (auto root = RE::PlayerCharacter::GetSingleton()->Get3D(false))
+				attach(root, color);
 	}
 }
